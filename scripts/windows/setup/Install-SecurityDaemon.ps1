@@ -13,6 +13,9 @@ param (
     [Parameter(ParameterSetName = "DPS")]
     [Switch] $Dps,
 
+    [Parameter(Mandatory = $false)]
+    [Switch] $UseWindowsContainers,
+
     [Parameter(Mandatory = $true, ParameterSetName = "Manual")]
     [String] $DeviceConnectionString,
 
@@ -59,9 +62,23 @@ function Install-SecurityDaemon {
 function Test-IsDockerRunning {
     if ((Get-Service "Docker").Status -eq "Running") {
         Write-Host "Docker is running." -ForegroundColor "Green"
-        return $true
-    }
-    else {
+        $os = Invoke-Native "docker version --format {{.Server.Os}}" -Passthru
+        if (($UseWindowsContainers) -and -not ($os -match "\s*windows\s*$")) {
+            Write-Host "Switching Docker to use Windows containers" -ForegroundColor "Green"
+            Invoke-Native "`"$env:ProgramFiles\Docker\Docker\DockerCli.exe`" -SwitchDaemon"
+            $os = Invoke-Native "docker version --format {{.Server.Os}}" -Passthru
+            if (-not ($os -match "\s*windows\s*$")) {
+                throw "Unable to switch to Windows containers."
+            }
+        } elseif (-not ($UseWindowsContainers) -and ($os -match "\s*windows\s*$")) {
+            Write-Host "Switching Docker to use Linux containers" -ForegroundColor "Green"
+            Invoke-Native "`"$env:ProgramFiles\Docker\Docker\DockerCli.exe`" -SwitchDaemon"
+            $os = Invoke-Native "docker version --format {{.Server.Os}}" -Passthru
+            if (($os -match "\s*windows\s*$")) {
+                throw "Unable to switch to Linux containers."
+            }
+        }
+    } else {
         Write-Host "Docker is not running." -ForegroundColor "Red"
         if ((Get-Item "HKLM:\Software\Microsoft\Windows NT\CurrentVersion").GetValue("EditionID") -eq "IoTUAP") {
             Write-Host ("Please visit https://docs.microsoft.com/en-us/azure/iot-edge/how-to-install-iot-core " +
@@ -75,28 +92,27 @@ function Test-IsDockerRunning {
         }
         return $false
     }
-}
+    return $true
+ }
 
 function Test-IsKernelValid {
-    $SupportedBuilds = @(17134)
+    $MinBuildForLinuxContainers = 14393
+    $SupportedBuildsForWindowsContainers = @(17134)
     $CurrentBuild = (Get-Item "HKLM:\Software\Microsoft\Windows NT\CurrentVersion").GetValue("CurrentBuild")
-    if ((Invoke-Native "docker info --format {{.Isolation}}" -Passthru) -match "hyperv") {
-        Write-Host "Hyper-V isolation is enabled." -ForegroundColor "Green"
+
+    # If using Linux containers, any Windows 10 version >14393 will suffice.
+    if ((-not ($UseWindowsContainers) -and ($CurrentBuild -ge $MinBuildForLinuxContainers)) -or `
+        (($UseWindowsContainers) -and ($SupportedBuildsForWindowsContainers -contains $CurrentBuild))) {
+        Write-Host "The container host is on supported build version $CurrentBuild." -ForegroundColor "Green"
         return $true
-    }
-    else {
-        Write-Host "Process isolation is enabled." -ForegroundColor "Green"
-        if ($SupportedBuilds -contains $CurrentBuild) {
-            Write-Host "The container host is on supported build version $CurrentBuild." -ForegroundColor "Green"
-            return $true
-        }
-        else {
-            Write-Host ("The container host is on unsupported build version $CurrentBuild. " +
-                "Please use a container host with one of the following supported build versions:`n" +
-                ($SupportedBuilds -join "`n")) `
-                -ForegroundColor "Red"
-            return $false
-        }
+    } else {
+
+        Write-Host ("The container host is on unsupported build version $CurrentBuild. `n" +
+            "Please use a container host running build $MinBuildForLinuxContainers newer when using Linux containers" +
+            "or with one of the following supported build versions when using Windows containers:`n" +
+            ($SupportedBuildsForWindowsContainers -join "`n")) `
+            -ForegroundColor "Red"
+        return $false
     }
 }
 
@@ -241,8 +257,13 @@ function Set-Hostname {
 
 function Set-GatewayAddress {
     $ConfigurationYaml = Get-Content "C:\ProgramData\iotedge\config.yaml" -Raw
-    $GatewayAddress = (Get-NetIpAddress |
-            Where-Object {$_.InterfaceAlias -like "*vEthernet (nat)*" -and $_.AddressFamily -like "IPv4"}).IPAddress
+    if (($UseWindowsContainers)) {
+        $GatewayAddress = (Get-NetIpAddress |
+                Where-Object {$_.InterfaceAlias -like "*vEthernet (nat)*" -and $_.AddressFamily -like "IPv4"}).IPAddress
+    } else {
+        $GatewayAddress = (Get-NetIpAddress |
+                Where-Object {$_.InterfaceAlias -like "*vEthernet (DockerNAT)*" -and $_.AddressFamily -like "IPv4"}).IPAddress
+    }
 
     $SelectionRegex = "connect:\s*management_uri:\s*`".*`"\s*workload_uri:\s*`".*`""
     $ReplacementContent = @(
@@ -268,12 +289,21 @@ function Set-GatewayAddress {
 function Set-MobyNetwork {
     $ConfigurationYaml = Get-Content "C:\ProgramData\iotedge\config.yaml" -Raw
     $SelectionRegex = "moby_runtime:\s*uri:\s*`".*`"\s*#?\s*network:\s*`".*`""
-    $ReplacementContent = @(
+    $ReplacementContentWindows = @(
         "moby_runtime:",
         "  docker_uri: `"npipe://./pipe/docker_engine`"",
         "  network: `"nat`"")
-    ($ConfigurationYaml -replace $SelectionRegex, ($ReplacementContent -join "`n")) | Set-Content "C:\ProgramData\iotedge\config.yaml" -Force
-    Write-Host "Set the Moby runtime network to NAT." -ForegroundColor "Green"
+    $ReplacementContentLinux = @(
+        "moby_runtime:",
+        "  docker_uri: `"npipe://./pipe/docker_engine`"",
+        "  network: `"azure-iot-edge`"")
+    if (($UseWindowsContainers)) {
+        ($ConfigurationYaml -replace $SelectionRegex, ($ReplacementContentWindows -join "`n")) | Set-Content "C:\ProgramData\iotedge\config.yaml" -Force
+        Write-Host "Set the Moby runtime network to nat." -ForegroundColor "Green"
+    } else {
+        ($ConfigurationYaml -replace $SelectionRegex, ($ReplacementContentLinux -join "`n")) | Set-Content "C:\ProgramData\iotedge\config.yaml" -Force
+        Write-Host "Set the Moby runtime network to azure-iot-edge." -ForegroundColor "Green"
+    }
 }
 
 function Invoke-Native {
