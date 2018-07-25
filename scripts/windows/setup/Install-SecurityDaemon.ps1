@@ -14,7 +14,7 @@ param (
     [Switch] $Dps,
 
     [Parameter(Mandatory = $false)]
-    [Switch] $UseWindowsContainers,
+    [Switch] $UseWindowsContainers = $true,
 
     [Parameter(Mandatory = $true, ParameterSetName = "Manual")]
     [String] $DeviceConnectionString,
